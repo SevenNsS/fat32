@@ -1,154 +1,249 @@
-#include "fat32.h"
-#include "dir.h"
-#include "page.h"
-#include "buffer.h"
-#include "mm.h"
-#include "lib.h"
+#include <fcntl.h>
+#include <linux/limits.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
-struct msdos_sb dosb;
+#include "fat.h"
+typedef struct {
+    uint8_t LDIR_Ord;
+    uint16_t LDIR_Name1[5];
+    uint8_t LDIR_Attr;
+    uint8_t LDIR_Type;
+    uint8_t LDIR_Chksum;
+    uint16_t LDIR_Name2[6];
+    uint16_t LDIR_FstClusLO;
+    uint16_t LDIR_Name3[2];
+} LongDirEntry;
 
-void get_fat_info(unsigned int fat32_sec);
-unsigned char *read_sec(unsigned int sector);
+/*
+ * Check if the given disk image is a FAT32 disk image.
+ * Return true if it is, false otherwise.
+ *
+ * WARNING: THIS FUNCTION IS FOR DEMONSTRATION PURPOSES ONLY!
+ * This function uses an external command called "file" to check the file
+ * system, but your program shouldn't rely on outside programs. You need to
+ * create your own function to check the file system type and delete this
+ * function before submitting. If you use this function in your submission,
+ * you'll get a penalty.
+ *
+ * RTFM: Section 3.5
+ */
+// bool check_fat32(const char *disk) {
+// #warning "You must remove this function before submitting."
+//     char buf[PATH_MAX];
+//     FILE *proc;
 
-static char buf_temp[65536];
-unsigned int cluster_size = 4096;
+//     snprintf(buf, PATH_MAX, "file %s", disk);
+//     proc = popen(buf, "r");
+//     if (proc == NULL) {
+//         perror("popen");
+//         exit(1);
+//     }
+//     fread(buf, 1, PATH_MAX, proc);
+//     return strstr(buf, "FAT (32 bit)") != NULL;
+// }
 
-static inline unsigned int find_first_partition()
-{
-	direct_read_sector(buf_temp, 0);
-        struct Partition *partition = (struct Partition*)((char*)buf_temp+0x1be);
-        return partition->startlba;
+unsigned int get_fat_type(const struct BPB *bpb) {
+    if (bpb->BPB_FATSz16 != 0) {
+        if (bpb->BPB_RootEntCnt == 0) {
+            return 32;
+        }
+        if (bpb->BPB_TotSec16 < 4085) {
+            return 12;
+        } else {
+            return 16;
+        }
+    } else {
+        return 32;
+    }
+}
+void list_files(const uint8_t *image, const struct BPB *hdr, uint32_t cluster) {
+    uint32_t fatsz;
+    uint32_t first_data_sector;
+	fatsz = hdr->fat32.BPB_FATSz32;
+
+    uint32_t root_dir_sectors = ((hdr->BPB_RootEntCnt * 32) + (hdr->BPB_BytsPerSec - 1)) / hdr->BPB_BytsPerSec;
+    first_data_sector = hdr->BPB_RsvdSecCnt + (hdr->BPB_NumFATs * fatsz) + root_dir_sectors;
+
+    wchar_t long_name[256] = {0};
+    int long_name_index = 0;
+
+
+    while (1) {
+        uint32_t first_sector = first_data_sector + (hdr->BPB_SecPerClus * (cluster - 2));
+        union DirEntry *entry = (union DirEntry *)(image + (hdr->BPB_BytsPerSec * first_sector));
+		union DirEntry *long_entry = &entry.ldir;
+        
+            if (entry.dir.DIR_Name[0] == 0x00) {
+                return;
+            }
+            if ((entry->dir.DIR_Attr & ATTR_LONG_NAME) == ATTR_LONG_NAME) {
+                int long_entry_index = (long_entry->ldir.LDIR_Ord & ~0x40) - 1;
+
+                for (int j = 0; j < 5; j++) {
+                    long_name[long_entry_index * 13 + j] = long_entry->ldir.LDIR_Name1[j];
+                }
+                for (int j = 0; j < 6; j++) {
+                    long_name[long_entry_index * 13 + 5 + j] = long_entry->ldir.LDIR_Name2[j];
+                }
+                for (int j = 0; j < 2; j++) {
+                    long_name[long_entry_index * 13 + 11 + j] = long_entry->ldir.LDIR_Name3[j];
+                }
+
+           	}
+
+			  if (entry.dir.DIR_Name[0] == 0xE5 || entry.dir.DIR_Name[0] == 0x2E) {
+				  memset(long_name, 0, sizeof(long_name));
+					 continue;
+				}
+
+            char name[256];
+            if (long_name[0]) {
+                wcstombs(name, long_name, sizeof(name));
+                memset(long_name, 0, sizeof(long_name));
+            } else {
+               strncpy(name, entry.dir.DIR_Name, 8);
+                int end = 7;
+                while (name[end] == ' ') {
+                    end--;
+                }
+                name[end + 1] = '.';
+                strncpy(name + end + 2, entry.dir.DIR_Name + 8, 3);
+                end += 4;
+                while (name[end] == ' ') {
+                    end--;
+                }
+                name[end + 1] = '\0';
+            }
+
+            if (entry.dir.DIR_Attr == ATTR_DIRECTORY) {
+                printf("Directory: %s\n", name);
+                uint32_t subcluster = entry.dir.DIR_FstClusLO | (entry.dir.DIR_FstClusHI << 16);
+                if (subcluster >= 2 && subcluster != cluster) {
+                    list_files(image, hdr, subcluster);
+                }
+            } else {
+				// wprintf(L"File: %ls\n", long_name);
+                printf("File: %s\n", name);
+            }
+
+
+    }
 }
 
-void init_fat()
-{
-	unsigned int FATSz;
-        unsigned int fat_table = find_first_partition();
-        get_fat_info(fat_table);
+/*
+ * Hexdump the given data.
+ *
+ * WARNING: THIS FUNCTION IS ONLY FOR DEBUGGING PURPOSES!
+ * This function prints the data using an external command called "hexdump", but
+ * your program should not depend on external programs. Before submitting, you
+ * must remove this function. If you include this function in your submission,
+ * you may face a penalty.
+ */
+// void hexdump(const void *data, size_t size) {
+// #warning "You must remove this function before submitting."
+//     FILE *proc;
 
-        if (fat.BPB_FATSz16 != 0)
-                FATSz = fat.BPB_FATSz16;
-        else
-                FATSz = fat.BPB_FATSz32;
+//     proc = popen("hexdump -C", "w");
+//     if (proc == NULL) {
+//         perror("popen");
+//         exit(1);
+//     }
+//     fwrite(data, 1, size, proc);
+// }
 
-        dosb.root_sec = (fat_table) + ((fat.BPB_RootEntCnt*32)+(fat.BPB_BytsPerSec-1))/fat.BPB_BytsPerSec;
-        dosb.first_fat_sec = fat_table + fat.BPB_ResvdSecCnt;
-        dosb.first_data_sec = fat.BPB_ResvdSecCnt+(fat.BPB_NumFATs * FATSz) + dosb.root_sec;
-	dosb.sec_per_clus = fat.BPB_SecPerClus;
-	dosb.cur_dir_clus = 2;
-	cluster_size = dosb.sec_per_clus * 512;
-}
+int main(int argc, char *argv[]) {
+    setbuf(stdout, NULL);
+    if (argc < 3) {
+        fprintf(stderr, "Usage: %s disk.img ck\n", argv[0]);
+        exit(1);
+    }
+    const char *diskimg = argv[1];
 
-void get_fat_info(unsigned int fat32_sec)
-{
-	direct_read_sector(buf_temp, fat32_sec);
-        memcpy((void*)&fat, buf_temp, sizeof(fat));
-}
+    /*
+     * This demo program only works on FAT32 disk images.
+     */
+//     if (!check_fat32(argv[1])) {
+//         fprintf(stderr, "%s is not a FAT32 disk image\n", diskimg);
+//         exit(1);
+//     }
 
-void list_all_cluster(unsigned int first_clus)
-{
-	unsigned int next_clus = first_clus;
-	do {
-		printf("%d -> ", next_clus);
-		fflush(NULL);
-		next_clus = fat_next_cluster(next_clus);
-	} while (next_clus != 0x0FFFFFFF);
-	printf("end\n");
-}
+    /*
+     * Open the disk image and map it to memory.
+     *
+     * This demonstration program opens the image in read-only mode, which means
+     * you won't be able to modify the disk image. However, if you need to make
+     * changes to the image in later tasks, you should open and map it in
+     * read-write mode.
+     */
+    int fd = open(diskimg, O_RDONLY);
+    if (fd < 0) {
+        perror("open");
+        exit(1);
+    }
+    // get file length
+    off_t size = lseek(fd, 0, SEEK_END);
+    if (size == -1) {
+        perror("lseek");
+        exit(1);
+    }
+    uint8_t *image = mmap(NULL, size, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (image == (void *)-1) {
+        perror("mmap");
+        exit(1);
+    }
+    close(fd);
 
-unsigned int fat_next_cluster(unsigned int currentry)
-{
-	struct address_space *addr = bread_sector(dosb.first_fat_sec + ((currentry * 4) / SECTOR_SIZE));
-	unsigned char *ptr = (unsigned char*)addr->data;
-	return *(unsigned int*)((ptr + ((currentry * 4) & (SECTOR_SIZE - 1))));
-}
+    /*
+     * Print some information about the disk image.
+     */
+    const struct BPB *hdr = (const struct BPB *)image;
+    unsigned int fat_type = get_fat_type(hdr);
+    if(strcmp(argv[2], "ck") == 0){
+        const char *fat_name = (fat_type == 12) ? "FAT12" : (fat_type == 16) ? "FAT16" : "FAT32";
+        printf("%s filesystem\n", fat_name);
+        printf("BytsPerSec = %u\n", hdr->BPB_BytsPerSec);
+        printf("SecPerClus = %u\n", hdr->BPB_SecPerClus);
+        printf("RsvdSecCnt = %u\n", hdr->BPB_RsvdSecCnt);
 
-int __fat_get_entry_slow(struct address_space **addr, struct dir_entry **de)
-{
-	if (unlikely(dosb.cur_dir_clus == 0x0FFFFFFF))
-		return -1;
-	*addr = bread_cluster(dosb.cur_dir_clus);
-	*de = (struct dir_entry*)(*addr)->data;
-	dosb.cur_dir_clus = fat_next_cluster(dosb.cur_dir_clus);
-	return 0;
-}
+        uint32_t fatsz = (fat_type != 32) ? hdr->BPB_FATSz16 : hdr->fat32.BPB_FATSz32;
+        printf("FATsSecCnt = %u\n", fatsz * hdr->BPB_NumFATs);
 
-int fat_get_entry(struct address_space **addr, struct dir_entry **de)
-{
-	static int count = 0;
-	if (*addr && *de &&
-		(*de - (struct dir_entry*)(*addr)->data) < (cluster_size / sizeof(struct dir_entry)) - 1) {
-		(*de)++;
-		++count;
-		return 0;
-	}
-	return __fat_get_entry_slow(addr, de);
-}
+        uint32_t root_sec_cnt = 0;
+        if (fat_type != 32) {
+            root_sec_cnt = ((hdr->BPB_RootEntCnt * 32) + (hdr->BPB_BytsPerSec - 1)) / hdr->BPB_BytsPerSec;
+        }
+        printf("RootSecCnt = %u\n", root_sec_cnt);
 
-static inline int fat_cmp_name(char *filename, char *search_name)
-{
-	if (is_short(filename) && is_short(search_name)) {	/* short name */
-		return memcmp(filename, search_name, 11);
-	}
+        uint32_t data_sec_cnt = hdr->BPB_TotSec32 - (hdr->BPB_RsvdSecCnt + (hdr->BPB_NumFATs * fatsz) + root_sec_cnt);
+        printf("DataSecCnt = %u\n", data_sec_cnt);
+    }else if (strcmp(argv[2], "ls") == 0) {
+        if (fat_type != 32) {
+            fprintf(stderr, "Only FAT32 is supported for ls command\n");
+            exit(1);
+        }
+        list_files(image, hdr, hdr->fat32.BPB_RootClus);
+    }
+    
+    
+    
+//     const struct BPB *hdr = (const struct BPB *)image;
+//     printf("FAT%d filesystem\n", 32);
+//     printf("BytsPerSec = %u\n", hdr->BPB_BytsPerSec);
+//     printf("SecPerClus = %u\n", hdr->BPB_SecPerClus);
+//     printf("RsvdSecCnt = %u\n", hdr->BPB_RsvdSecCnt);
+//     printf("FATsSecCnt = ?\n");
+//     printf("RootSecCnt = ?\n");
+//     printf("DataSecCnt = ?\n");
 
-	if (strlen(filename) != strlen(search_name))
-		return -1;
-	return memcmp(filename, search_name, strlen(filename));
-}
+    /*
+     * Print the contents of the first cluster.
+     */
+    //hexdump(image, sizeof(*hdr));
 
-/* return:
-   0: parse ok, but we don't need
-   1: parse ok, and we need
-  -1: parse failed
-*/
-int fat_parse_long(struct address_space **addr, struct dir_entry **de, char *search_name, int fd, int search)
-{
-	char filename[260];
-	unsigned char slot;
-	struct dir_long_entry *dle = (struct dir_long_entry*)*de;
-	unsigned char checksum = dle->alias_checksum;
-	if (!(dle->id & 0x40)) {
-		printf("Parse error!");
-		return -1;
-	}
-
-	slot = dle->id & ~0x40;
-	filename[slot*13] = '\0';
-	while (1) {
-		--slot;
-		namecpy(filename + slot * 13, dle->name0_4, 5);
-		namecpy(filename + slot * 13 + 5, dle->name5_10, 6);
-		namecpy(filename + slot * 13 + 11, dle->name11_12, 2);
-
-		if (slot == 0)
-			break;
-		fat_get_entry(addr, de);
-		dle = (struct dir_long_entry*)*de;
-		if (dle->alias_checksum != checksum) {
-			printf("Checksum1 error!\n");
-			return -1;
-		}
-	}
-	fat_get_entry(addr, de);
-	if (fat_checksum((*de)->name) != checksum) {
-		printf("long name checksum error\n");
-		return -1;
-	}
-	if (search == 0) {
-		printf("%s, %d bytes\n", filename, (*de)->size);
-		return 0;
-	}
-	if (is_short(filename)) {
-		char dstfile[12];
-		memset((void*)&dstfile[0], 0x20, sizeof(dstfile));
-		fmtfname(dstfile, filename);
-		memcpy(filename, dstfile, 12);
-	}
-	if (fat_cmp_name(filename, search_name) == 0) {
-		fd_pool[fd].cur_clus = fd_pool[fd].cluster = ((*de)->starthi << 16 | (*de)->start);
-		fd_pool[fd].size = (*de)->size;
-		printf("Found %s @ %d, %d bytes\n", filename, fd_pool[fd].cluster, (*de)->size);
-		return 1;
-	}
-	return 0;
+    munmap(image, size);
 }
